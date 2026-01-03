@@ -7,15 +7,34 @@ import (
 	"os"
 	"time"
 
-	"github.com/Van1sexboy/proj_avt/modules" // Твои структуры
-
+	"github.com/Van1sexboy/proj_avt/modules"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var db *mongo.Database
+
+// Карта разрешений (Шаг 9)
+var rolePermissions = map[string][]string{
+	"Студент": {
+		"course:testList", "course:user:add", "quest:read",
+		"test:answer:read", "answer:update", "answer:del",
+	},
+	"Преподаватель": {
+		"user:fullName:write", "course:info:write", "course:test:read",
+		"course:test:write", "course:test:add", "course:test:del",
+		"course:userList", "course:user:del", "course:del",
+		"quest:list:read", "quest:update", "quest:del",
+		"test:quest:del", "test:quest:add", "test:quest:update",
+	},
+	"Админ": {
+		"user:list:read", "user:roles:read", "user:roles:write",
+		"user:block:read", "user:block:write", "course:add", "quest:create",
+	},
+}
 
 func main() {
 	godotenv.Load()
@@ -26,41 +45,140 @@ func main() {
 	db = client.Database(dbName)
 	fmt.Printf("Успех! Подключились к базе данных: %s\n", dbName)
 
-	// Инициализируем веб-сервер Gin
 	r := gin.Default()
 
-	// Реализуем ПУНКТ 1 из сценария: Запрос авторизации
+	// 1. Начало входа
 	r.GET("/auth/login", func(c *gin.Context) {
-		authType := c.Query("type")    // github или yandex
-		tokenIn := c.Query("token_in") // токен входа от веб-клиента или бота
+		authType := c.Query("type")
+		tokenIn := c.Query("token_in")
 
 		if tokenIn == "" || authType == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "нужны type и token_in"})
 			return
 		}
 
-		// 1. Формируем структуру для сохранения в базу ("словарь")
 		stateEntry := modules.LoginState{
 			TokenIn:   tokenIn,
 			Status:    "не получен",
-			ExpiresAt: time.Now().Add(5 * time.Minute), // Устареет через 5 минут
+			ExpiresAt: time.Now().Add(5 * time.Minute),
 		}
 
-		// 2. Сохраняем в коллекцию "states"
-		_, err := db.Collection("states").InsertOne(context.TODO(), stateEntry)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "ошибка базы данных"})
-			return
-		}
+		db.Collection("states").InsertOne(context.TODO(), stateEntry)
 
-		// 3. Формируем ссылку на GitHub/Yandex (согласно сценарию)
 		clientID := os.Getenv("GITHUB_CLIENT_ID")
-		// Параметр state в OAuth2 идеально подходит для передачи нашего token_in
 		redirectURL := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&state=%s", clientID, tokenIn)
 
-		// 4. Отправляем ссылку в ответ
 		c.JSON(http.StatusOK, gin.H{"url": redirectURL})
 	})
 
-	r.Run(":" + os.Getenv("PORT")) // Запускаем сервер (например, на 8080)
+	// 2. ОБРАБОТКА CALLBACK
+	r.GET("/auth/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		tokenIn := c.Query("state")
+
+		if code == "" || tokenIn == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "отсутствует код или state"})
+			return
+		}
+
+		userEmail := "test-user@example.com" // Заглушка
+
+		var user modules.User
+		err := db.Collection("users").FindOne(context.TODO(), map[string]string{"email": userEmail}).Decode(&user)
+
+		if err != nil {
+			user = modules.User{
+				Email:    userEmail,
+				FullName: "Аноним_" + tokenIn[:4],
+				Roles:    []string{"Студент"},
+			}
+			db.Collection("users").InsertOne(context.TODO(), user)
+		}
+
+		accessToken, refreshToken, err := generateTokens(user.Email, user.Roles)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "ошибка генерации токенов"})
+			return
+		}
+
+		db.Collection("states").UpdateOne(context.TODO(),
+			map[string]string{"token_in": tokenIn},
+			map[string]interface{}{
+				"$set": map[string]string{
+					"status":        "доступ предоставлен",
+					"access_token":  accessToken,
+					"refresh_token": refreshToken,
+				},
+			},
+		)
+
+		c.Writer.Write([]byte("<h1>Авторизация успешна!</h1><p>Пользователь и токены в базе.</p>"))
+	})
+
+	// 3. Проверка статуса входа (ТЕПЕРЬ ВНУТРИ main)
+	r.GET("/auth/check", func(c *gin.Context) {
+		tokenIn := c.Query("token_in")
+
+		if tokenIn == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "нужен token_in"})
+			return
+		}
+
+		var state modules.LoginState
+		err := db.Collection("states").FindOne(context.TODO(), map[string]string{"token_in": tokenIn}).Decode(&state)
+
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"status": "не опознанный токен"})
+			return
+		}
+
+		if time.Now().After(state.ExpiresAt) {
+			c.JSON(http.StatusUnauthorized, gin.H{"status": "время действия токена закончилось"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":        state.Status,
+			"access_token":  state.AccessToken,
+			"refresh_token": state.RefreshToken,
+		})
+	})
+
+	// Запуск сервера всегда должен быть ПОСЛЕДНИМ в main
+	r.Run(":" + os.Getenv("PORT"))
+}
+
+// Вспомогательные функции ВСЕГДА ВНЕ main
+func getPermissions(roles []string) []string {
+	permissions := []string{}
+	seen := make(map[string]bool)
+	for _, role := range roles {
+		if perms, ok := rolePermissions[role]; ok {
+			for _, p := range perms {
+				if !seen[p] {
+					seen[p] = true
+					permissions = append(permissions, p)
+				}
+			}
+		}
+	}
+	return permissions
+}
+
+func generateTokens(email string, roles []string) (string, string, error) {
+	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
+
+	accessClaims := jwt.MapClaims{
+		"permissions": getPermissions(roles),
+		"exp":         time.Now().Add(time.Minute * 1).Unix(),
+	}
+	accessToken, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(jwtSecret)
+
+	refreshClaims := jwt.MapClaims{
+		"email": email,
+		"exp":   time.Now().Add(time.Hour * 24 * 7).Unix(),
+	}
+	refreshToken, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(jwtSecret)
+
+	return accessToken, refreshToken, nil
 }
