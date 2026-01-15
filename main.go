@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"time"
@@ -12,7 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
-	"go.mongodb.org/mongo-driver/bson" // сложных запросов
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -20,41 +21,21 @@ import (
 
 var db *mongo.Database
 
-// Карта разрешений из ТЗ
+// Карта разрешений
 var rolePermissions = map[string][]string{
-	"Студент": {
-		"course:testList", "course:user:add", "quest:read",
-		"test:answer:read", "answer:update", "answer:del",
-	},
-	"Преподаватель": {
-		"user:fullName:write", "course:info:write", "course:test:read",
-		"course:test:write", "course:test:add", "course:test:del",
-		"course:userList", "course:user:del", "course:del",
-		"quest:list:read", "quest:update", "quest:del",
-		"test:quest:del", "test:quest:add", "test:quest:update",
-	},
-	"Админ": {
-		"user:list:read", "user:roles:read", "user:roles:write",
-		"user:block:read", "user:block:write", "course:add", "quest:create",
-	},
+	"Студент":       {"course:testList", "course:user:add", "quest:read", "test:answer:read", "answer:update", "answer:del"},
+	"Преподаватель": {"user:fullName:write", "course:info:write", "course:test:read", "course:test:write", "course:test:add", "course:test:del", "course:userList", "course:user:del", "course:del", "quest:list:read", "quest:update", "quest:del", "test:quest:del", "test:quest:add", "test:quest:update"},
+	"Админ":         {"user:list:read", "user:roles:read", "user:roles:write", "user:block:read", "user:block:write", "course:add", "quest:create"},
 }
 
 func main() {
 	godotenv.Load()
-	mongoURI := os.Getenv("MONGO_URI")
-	dbName := os.Getenv("DB_NAME")
-
-	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(mongoURI))
-	if err != nil {
-		fmt.Printf("Ошибка подключения к БД: %v\n", err)
-		return
-	}
-	db = client.Database(dbName)
-	fmt.Printf("Успех! Подключились к базе данных: %s\n", dbName)
+	client, _ := mongo.Connect(context.TODO(), options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+	db = client.Database(os.Getenv("DB_NAME"))
 
 	r := gin.Default()
 
-	// 1. Начало входа (УЧИТЫВАЕМ ТИП: github/yandex)
+	// Авторизация  через GitHub/Yandex
 	r.GET("/auth/login", func(c *gin.Context) {
 		authType := c.Query("type")
 		tokenIn := c.Query("token_in")
@@ -64,228 +45,181 @@ func main() {
 			return
 		}
 
-		stateEntry := modules.LoginState{
-			TokenIn:   tokenIn,
-			Status:    "не получен",
-			ExpiresAt: time.Now().Add(5 * time.Minute),
-		}
-		db.Collection("states").InsertOne(context.TODO(), stateEntry)
+		// Состояние "не получен"
+		saveLoginState(tokenIn)
 
-		var redirectURL string
 		if authType == "github" {
-			clientID := os.Getenv("GITHUB_CLIENT_ID")
-			redirectURL = fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&state=%s&scope=user:email", clientID, tokenIn)
+			url := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&state=%s&scope=user:email", os.Getenv("GITHUB_CLIENT_ID"), tokenIn)
+			c.JSON(http.StatusOK, gin.H{"url": url})
 		} else if authType == "yandex" {
-			clientID := os.Getenv("YANDEX_CLIENT_ID")
-			redirectURL = fmt.Sprintf("https://oauth.yandex.ru/authorize?response_type=code&client_id=%s&state=%s", clientID, tokenIn)
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "неизвестный тип авторизации"})
-			return
+			url := fmt.Sprintf("https://oauth.yandex.ru/authorize?response_type=code&client_id=%s&state=%s", os.Getenv("YANDEX_CLIENT_ID"), tokenIn)
+			c.JSON(http.StatusOK, gin.H{"url": url})
+		} else if authType == "code" {
+			// Авторизация по коду
+			code := generateRandomCode(6)
+			db.Collection("auth_codes").InsertOne(context.TODO(), modules.AuthCodeEntry{
+				Code:      code,
+				TokenIn:   tokenIn,
+				ExpiresAt: time.Now().Add(time.Minute),
+			})
+			c.JSON(http.StatusOK, gin.H{"code": code})
 		}
-
-		c.JSON(http.StatusOK, gin.H{"url": redirectURL})
 	})
 
-	// 2. ОБРАБОТКА CALLBACK (Логика обмена кода на email и JWT)
-	r.GET("/auth/callback", func(c *gin.Context) {
-		code := c.Query("code")
-		tokenIn := c.Query("state")
+	// CALLBACKS
+	r.GET("/auth/callback/github", handleGitHubCallback)
+	r.GET("/auth/callback/yandex", handleYandexCallback)
 
-		if code == "" || tokenIn == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "отсутствует код или state"})
+	// Подтверждение кода для устройства, которое уже вошло
+	r.POST("/auth/code/confirm", func(c *gin.Context) {
+		var req struct {
+			Code         string `json:"code"`
+			RefreshToken string `json:"refresh_token"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 			return
 		}
 
-		// Для простоты примера делаем логику GitHub (для Яндекса нужны свои URL)
-		clientID := os.Getenv("GITHUB_CLIENT_ID")
-		clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
-
-		tokenURL := fmt.Sprintf("https://github.com/login/oauth/access_token?client_id=%s&client_secret=%s&code=%s", clientID, clientSecret, code)
-		req, _ := http.NewRequest("POST", tokenURL, nil)
-		req.Header.Set("Accept", "application/json")
-
-		httpClient := &http.Client{}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "ошибка запроса к GitHub"})
+		// Проверка код
+		var codeEntry modules.AuthCodeEntry
+		err := db.Collection("auth_codes").FindOne(context.TODO(), bson.M{"code": req.Code}).Decode(&codeEntry)
+		if err != nil || time.Now().After(codeEntry.ExpiresAt) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "код не найден или устарел"})
 			return
 		}
-		defer resp.Body.Close()
 
-		var tokenRes modules.GitHubTokenResponse
-		json.NewDecoder(resp.Body).Decode(&tokenRes)
-
-		req, _ = http.NewRequest("GET", "https://api.github.com/user", nil)
-		req.Header.Set("Authorization", "token "+tokenRes.AccessToken)
-		resp, _ = httpClient.Do(req)
-		defer resp.Body.Close()
-
-		var userRes modules.GitHubUserResponse
-		json.NewDecoder(resp.Body).Decode(&userRes)
-
-		userEmail := userRes.Email
-		if userEmail == "" {
-			userEmail = userRes.Login + "@github.com"
-		}
-
-		// Поиск/Создание пользователя в Mongo
-		var user modules.User
-		err = db.Collection("users").FindOne(context.TODO(), bson.M{"email": userEmail}).Decode(&user)
-
+		email, err := validateRefreshToken(req.RefreshToken)
 		if err != nil {
-			user = modules.User{
-				Email:         userEmail,
-				FullName:      "Аноним_" + tokenIn[:4],
-				Roles:         []string{"Студент"},
-				RefreshTokens: []string{},
-			}
-			res, _ := db.Collection("users").InsertOne(context.TODO(), user)
-			user.ID = res.InsertedID.(primitive.ObjectID)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "ошибка подтверждающего токена"})
+			return
 		}
 
-		accessToken, refreshToken, _ := generateTokens(user.Email, user.Roles)
-
-		// Сохраняем Refresh в БД пользователя
-		db.Collection("users").UpdateOne(context.TODO(),
-			bson.M{"email": user.Email},
-			bson.M{"$push": bson.M{"refresh_tokens": refreshToken}},
-		)
-
-		// Обновляем статус временного входа
-		db.Collection("states").UpdateOne(context.TODO(),
-			bson.M{"token_in": tokenIn},
-			bson.M{"$set": bson.M{
-				"status":        "доступ предоставлен",
-				"access_token":  accessToken,
-				"refresh_token": refreshToken,
-			}},
-		)
-
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, "<h1>Успешно!</h1><p>Вернитесь в приложение.</p>")
+		finishLogin(codeEntry.TokenIn, email)
+		c.JSON(http.StatusOK, gin.H{"status": "доступ предоставлен"})
 	})
 
-	// 3. Проверка статуса (для Web и Бота)
-	r.GET("/auth/check", func(c *gin.Context) {
-		tokenIn := c.Query("token_in")
-		var state modules.LoginState
-		err := db.Collection("states").FindOne(context.TODO(), bson.M{"token_in": tokenIn}).Decode(&state)
-
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"status": "не опознанный токен"})
-			return
-		}
-
-		if time.Now().After(state.ExpiresAt) {
-			c.JSON(http.StatusUnauthorized, gin.H{"status": "время действия токена закончилось"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"status":        state.Status,
-			"access_token":  state.AccessToken,
-			"refresh_token": state.RefreshToken,
-		})
-	})
-
-	// 4. Обновление токенов (Refresh Token Rotation)
+	// Refresh
 	r.POST("/auth/refresh", func(c *gin.Context) {
 		var body struct {
 			RefreshToken string `json:"refresh_token"`
 		}
-		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "нужен refresh_token"})
-			return
-		}
+		c.ShouldBindJSON(&body)
 
-		token, err := jwt.Parse(body.RefreshToken, func(t *jwt.Token) (interface{}, error) {
-			return []byte(os.Getenv("JWT_SECRET")), nil
-		})
-
-		if err != nil || !token.Valid {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "невалидный токен"})
-			return
-		}
-
-		claims := token.Claims.(jwt.MapClaims)
-		email := claims["email"].(string)
-
-		// Проверяем наличие токена у пользователя в массиве refresh_tokens
-		var user modules.User
-		err = db.Collection("users").FindOne(context.TODO(), bson.M{
-			"email":          email,
-			"refresh_tokens": body.RefreshToken,
-		}).Decode(&user)
-
+		email, err := validateRefreshToken(body.RefreshToken)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "токен отозван"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh"})
+			return
+		}
+
+		var user modules.User
+		db.Collection("users").FindOne(context.TODO(), bson.M{"email": email, "refresh_tokens": body.RefreshToken}).Decode(&user)
+
+		if user.Email == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "token revoked"})
 			return
 		}
 
 		newA, newR, _ := generateTokens(user.Email, user.Roles)
 
-		// Заменяем старый на новый (Rotation)
 		db.Collection("users").UpdateOne(context.TODO(), bson.M{"email": email}, bson.M{"$pull": bson.M{"refresh_tokens": body.RefreshToken}})
 		db.Collection("users").UpdateOne(context.TODO(), bson.M{"email": email}, bson.M{"$push": bson.M{"refresh_tokens": newR}})
 
 		c.JSON(http.StatusOK, gin.H{"access_token": newA, "refresh_token": newR})
 	})
 
-	// 5. Выход (Logout)
-	r.POST("/auth/logout", func(c *gin.Context) {
-		refresh := c.Query("refresh_token")
-		all := c.Query("all") == "true"
-
-		token, _ := jwt.Parse(refresh, func(t *jwt.Token) (interface{}, error) {
-			return []byte(os.Getenv("JWT_SECRET")), nil
-		})
-
-		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			email := claims["email"].(string)
-			if all {
-				db.Collection("users").UpdateOne(context.TODO(), bson.M{"email": email}, bson.M{"$set": bson.M{"refresh_tokens": []string{}}})
-			} else {
-				db.Collection("users").UpdateOne(context.TODO(), bson.M{"email": email}, bson.M{"$pull": bson.M{"refresh_tokens": refresh}})
-			}
-			c.JSON(http.StatusOK, gin.H{"status": "выход выполнен"})
-			return
-		}
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "ошибка"})
-	})
+	r.GET("/auth/check", checkStatusHandler)
 
 	r.Run(":" + os.Getenv("PORT"))
 }
 
-func getPermissions(roles []string) []string {
-	permissions := []string{}
-	seen := make(map[string]bool)
-	for _, role := range roles {
-		if perms, ok := rolePermissions[role]; ok {
-			for _, p := range perms {
-				if !seen[p] {
-					seen[p] = true
-					permissions = append(permissions, p)
-				}
-			}
+// Хендлеры
+
+func handleYandexCallback(c *gin.Context) {
+	code := c.Query("code")
+	tokenIn := c.Query("state")
+
+	userEmail := "user@yandex.ru"
+	finishLogin(tokenIn, userEmail)
+
+	c.String(http.StatusOK, "Авторизация Яндекс успешна. Вернитесь в приложение.")
+}
+
+func finishLogin(tokenIn string, email string) {
+	var user modules.User
+	err := db.Collection("users").FindOne(context.TODO(), bson.M{"email": email}).Decode(&user)
+
+	if err != nil {
+		// Если нет в базе, то...
+		user = modules.User{
+			Email:    email,
+			FullName: "Аноним_" + generateRandomCode(4),
+			Roles:    []string{"Студент"},
 		}
+		res, _ := db.Collection("users").InsertOne(context.TODO(), user)
+		user.ID = res.InsertedID.(primitive.ObjectID)
 	}
-	return permissions
+
+	acc, ref, _ := generateTokens(user.Email, user.Roles)
+
+	// Сохраняем refresh в базу даных
+	db.Collection("users").UpdateOne(context.TODO(), bson.M{"_id": user.ID}, bson.M{"$push": bson.M{"refresh_tokens": ref}})
+
+	// Обновление статуса входа
+	db.Collection("states").UpdateOne(context.TODO(), bson.M{"token_in": tokenIn}, bson.M{
+		"$set": bson.M{
+			"status":        "доступ предоставлен",
+			"access_token":  acc,
+			"refresh_token": ref,
+		},
+	})
 }
 
 func generateTokens(email string, roles []string) (string, string, error) {
-	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
+	secret := []byte(os.Getenv("JWT_SECRET"))
 
-	accessClaims := jwt.MapClaims{
+	// Access: Только права и 1 минута жизни
+	accClaims := jwt.MapClaims{
 		"permissions": getPermissions(roles),
-		"exp":         time.Now().Add(time.Minute * 1).Unix(),
+		"exp":         time.Now().Add(time.Minute).Unix(),
 	}
-	accessToken, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(jwtSecret)
+	acc, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, accClaims).SignedString(secret)
 
-	refreshClaims := jwt.MapClaims{
+	// Refresh: Почта и 7 дней жизни
+	refClaims := jwt.MapClaims{
 		"email": email,
 		"exp":   time.Now().Add(time.Hour * 24 * 7).Unix(),
 	}
-	refreshToken, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(jwtSecret)
+	ref, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, refClaims).SignedString(secret)
 
-	return accessToken, refreshToken, nil
+	return acc, ref, nil
+}
+
+func validateRefreshToken(tokenStr string) (string, error) {
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		return []byte(os.Getenv("JWT_SECRET")), nil
+	})
+	if err != nil || !token.Valid {
+		return "", fmt.Errorf("invalid token")
+	}
+	claims := token.Claims.(jwt.MapClaims)
+	return claims["email"].(string), nil
+}
+
+func generateRandomCode(n int) string {
+	const letters = "0123456789"
+	ret := make([]byte, n)
+	for i := 0; i < n; i++ {
+		num, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		ret[i] = letters[num.Int64()]
+	}
+	return string(ret)
+}
+
+func saveLoginState(tokenIn string) {
+	db.Collection("states").InsertOne(context.TODO(), modules.LoginState{
+		TokenIn:   tokenIn,
+		Status:    "не получен",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	})
 }
